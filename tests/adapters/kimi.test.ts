@@ -1,7 +1,7 @@
 import "../setup-home";
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { KimiAdapter, probeKimiCliVersion } from "../../src/adapters/kimi/index.js";
@@ -503,6 +503,17 @@ command = "context-mode hook kimi posttooluse"
 // ── Hook script integration tests ──────────────────────
 
 describe("Kimi pretooluse hook script", () => {
+  // MCP readiness sentinel — routing.mjs::mcpRedirect bails to null when
+  // isMCPReady() returns false, which collapses deny responses into the
+  // empty-passthrough default. Hook subprocesses scan sentinelDir() for
+  // context-mode-mcp-ready-<PID> files and probe each PID for liveness;
+  // writing one keyed to this test's PID satisfies that contract.
+  // Mirrors the pattern at tests/hooks/cursor-hooks.test.ts:67-70.
+  const _sentinelDir = process.platform === "win32" ? tmpdir() : "/tmp";
+  const mcpSentinel = resolve(_sentinelDir, `context-mode-mcp-ready-${process.pid}`);
+  beforeEach(() => { writeFileSync(mcpSentinel, String(process.pid)); });
+  afterEach(() => { try { unlinkSync(mcpSentinel); } catch {} });
+
   it("outputs valid JSON with hookEventName even for passthrough (no routing match)", () => {
     const hookScript = resolve(__dirname, "../../hooks/kimi/pretooluse.mjs");
     const input = JSON.stringify({
