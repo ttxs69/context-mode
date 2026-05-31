@@ -1318,6 +1318,32 @@ export class SessionDB extends SQLiteBase {
     }
   }
 
+  /**
+   * Return the distinct list of session ids whose events were attributed
+   * to a given `project_dir`. Powers the ctx_search `project:` filter
+   * (#737) via the 2-step IN-clause strategy — ATTACH DATABASE is avoided
+   * because SQLite's WAL + ATTACH combination has known correctness
+   * trade-offs flagged in the upstream docs.
+   *
+   * Backed by the `idx_session_events_project(session_id, project_dir)`
+   * composite index, so 1000-session lookups complete in single-digit
+   * milliseconds. Best-effort: returns `[]` on any error.
+   */
+  getSessionIdsForProject(projectDir: string): string[] {
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT DISTINCT session_id
+             FROM session_events
+            WHERE project_dir = ?`,
+        )
+        .all(projectDir) as Array<{ session_id: string }>;
+      return rows.map((r) => r.session_id);
+    } catch {
+      return [];
+    }
+  }
+
   // ═══════════════════════════════════════════
   // Meta
   // ═══════════════════════════════════════════
