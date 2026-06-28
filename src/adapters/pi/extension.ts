@@ -12,7 +12,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -25,29 +25,82 @@ import type { SessionEvent } from "../../types.js";
 import { bootstrapMCPTools, makeBridgeDiag, isForegroundSession, type BridgeHandle } from "./mcp-bridge.js";
 import { PiAdapter } from "./index.js";
 
-// ─── Opt-out flags for pi-specific injection behavior ───────────────
+// ─── pi-specific injection behavior (configurable via settings.json) ───────────────
 //
-// CONTEXT_MODE_PI_ANCHOR=0     → suppress the "context-mode active. Hierarchy: ..."
-//                                routing anchor that the upstream build pushes into
-//                                the system prompt on every turn. Pi's host already
-//                                exposes the full tool inventory via pi.registerTool();
-//                                the anchor is redundant for pi and can confuse the
-//                                model about which tools it actually has.
+// Two pieces of upstream behavior can be opted out of independently:
 //
-// CONTEXT_MODE_PI_AUTO_INJECT=0 → suppress the auto-injected <active_memory> /
-//                                <session_state source="compaction"> block built
-//                                from prior session events. Per upstream issue #856,
-//                                re-injecting session events as standing directives
-//                                can produce do-nothing loops. Events remain in the
-//                                context-mode DB and are still queryable on demand
-//                                via ctx_search(source: "session-events").
+//   anchor       — the "context-mode active. Hierarchy: ..." string pushed into
+//                  the system prompt on every turn. Pi's host already exposes
+//                  the full tool inventory via pi.registerTool(); the anchor is
+//                  redundant for pi and can confuse the model about which tools
+//                  it actually has.
 //
-// Both default to "enabled" so behavior matches upstream when the flags are unset.
-// Set either to "0", "false", "no", or "off" (case-insensitive) to opt out.
-function isOptOut(name: string): boolean {
-  const v = String(process.env[name] ?? "").trim().toLowerCase();
-  return v === "0" || v === "false" || v === "no" || v === "off";
+//   autoInject   — the auto-injected <active_memory> / <session_state source=
+//                  "compaction"> block built from prior session events. Per
+//                  upstream issue #856, re-injecting session events as standing
+//                  directives can produce do-nothing loops. Events remain in the
+//                  context-mode DB and are still queryable on demand via
+//                  ctx_search(source: "session-events").
+//
+// Configure in ~/.pi/agent/settings.json under the `contextMode.pi` key:
+//
+//   {
+//     "contextMode": {
+//       "pi": {
+//         "anchor": false,       // default: true (matches upstream)
+//         "autoInject": false    // default: true (matches upstream)
+//       }
+//     }
+//   }
+//
+// Each field is optional; missing values fall back to upstream defaults. Project-
+// local `.pi/context-mode.json` (if present) overrides the global setting on a
+// per-project basis. If settings can't be read (missing file, parse error), we
+// fall back to upstream behavior silently — the extension never fails to load
+// because of config problems.
+//
+// -- fork: ttxs69/context-mode, opt-in/opt-out via settings.json instead of env vars.
+interface PiInjectionConfig {
+  anchor: boolean;
+  autoInject: boolean;
 }
+
+const DEFAULT_INJECTION_CONFIG: PiInjectionConfig = {
+  anchor: true,
+  autoInject: true,
+};
+
+function readJsonSafe(path: string): unknown {
+  try {
+    if (!existsSync(path)) return undefined;
+    return JSON.parse(readFileSync(path, "utf-8"));
+  } catch {
+    return undefined;
+  }
+}
+
+function loadInjectionConfig(cwd?: string): PiInjectionConfig {
+  const home = homedir();
+  // Project-local override (per-project tuning) takes precedence; falls back to
+  // global ~/.pi/agent/settings.json. Either may be absent; missing keys fall
+  // back to upstream defaults. If reading fails for any reason, we silently
+  // use upstream defaults — the extension never fails to load on config errors.
+  const projectPath = cwd ? join(cwd, ".pi", "context-mode.json") : undefined;
+  const globalPath = join(home, ".pi", "agent", "settings.json");
+  const settings = (projectPath ? readJsonSafe(projectPath) : undefined) ??
+    readJsonSafe(globalPath);
+  const pi = (settings as any)?.contextMode?.pi;
+  return {
+    anchor: typeof pi?.anchor === "boolean" ? pi.anchor : DEFAULT_INJECTION_CONFIG.anchor,
+    autoInject:
+      typeof pi?.autoInject === "boolean" ? pi.autoInject : DEFAULT_INJECTION_CONFIG.autoInject,
+  };
+}
+
+// Default at module load; refreshed per-turn inside before_agent_start so
+// per-project `.pi/context-mode.json` and global settings changes take effect
+// without requiring a pi restart.
+let _injectionConfig: PiInjectionConfig = loadInjectionConfig();
 
 // ── Pi Tool Name Mapping ─────────────────────────────────
 // Pi uses lowercase; shared extractors expect PascalCase (Claude Code convention).
@@ -679,9 +732,15 @@ export default function piExtension(pi: any): void {
       // already tell the model what each tool does. This anchor gives the
       // deliberate choice (which tool for which scenario) without the full
       // block/redirect/memory/tool-selection hierarchy.
+      // Refresh per-turn config so global edits to ~/.pi/agent/settings.json or
+      // a project-local .pi/context-mode.json take effect immediately. Cost is
+      // negligible (one file read + JSON parse) and keeps the model prompt
+      // strictly in sync with the user's stated preferences.
+      _injectionConfig = loadInjectionConfig(ctx?.cwd);
+
       //
-      // Opt out with CONTEXT_MODE_PI_ANCHOR=0.
-      if (!isOptOut("CONTEXT_MODE_PI_ANCHOR")) {
+      // Opt out via contextMode.pi.anchor = false in settings.json.
+      if (_injectionConfig.anchor) {
         parts.push(
           "context-mode active. Hierarchy: ctx_batch_execute > ctx_execute > ctx_execute_file > ctx_search. " +
           "Read/edit files → ctx_execute_file. Multi-command research → ctx_batch_execute. " +
@@ -704,11 +763,11 @@ export default function piExtension(pi: any): void {
       // remain queryable via ctx_search(source: "session-events"); intent,
       // skills, decisions, and the resume snapshot are unaffected.
       //
-      // Opt out entirely with CONTEXT_MODE_PI_AUTO_INJECT=0. When opted out,
-      // session events are still captured to the context-mode DB and remain
-      // queryable on demand via ctx_search(source: "session-events") — they
-      // just aren't auto-pinned to the system prompt on every turn.
-      if (!isOptOut("CONTEXT_MODE_PI_AUTO_INJECT")) {
+      // Opt out entirely via contextMode.pi.autoInject = false in settings.json.
+      // When opted out, session events are still captured to the context-mode DB
+      // and remain queryable on demand via ctx_search(source: "session-events") —
+      // they just aren't auto-pinned to the system prompt on every turn.
+      if (_injectionConfig.autoInject) {
         const activeEvents = db
           .getEvents(_sessionId, {
             minPriority: 3,
