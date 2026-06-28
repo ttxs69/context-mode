@@ -25,6 +25,30 @@ import type { SessionEvent } from "../../types.js";
 import { bootstrapMCPTools, makeBridgeDiag, isForegroundSession, type BridgeHandle } from "./mcp-bridge.js";
 import { PiAdapter } from "./index.js";
 
+// ─── Opt-out flags for pi-specific injection behavior ───────────────
+//
+// CONTEXT_MODE_PI_ANCHOR=0     → suppress the "context-mode active. Hierarchy: ..."
+//                                routing anchor that the upstream build pushes into
+//                                the system prompt on every turn. Pi's host already
+//                                exposes the full tool inventory via pi.registerTool();
+//                                the anchor is redundant for pi and can confuse the
+//                                model about which tools it actually has.
+//
+// CONTEXT_MODE_PI_AUTO_INJECT=0 → suppress the auto-injected <active_memory> /
+//                                <session_state source="compaction"> block built
+//                                from prior session events. Per upstream issue #856,
+//                                re-injecting session events as standing directives
+//                                can produce do-nothing loops. Events remain in the
+//                                context-mode DB and are still queryable on demand
+//                                via ctx_search(source: "session-events").
+//
+// Both default to "enabled" so behavior matches upstream when the flags are unset.
+// Set either to "0", "false", "no", or "off" (case-insensitive) to opt out.
+function isOptOut(name: string): boolean {
+  const v = String(process.env[name] ?? "").trim().toLowerCase();
+  return v === "0" || v === "false" || v === "no" || v === "off";
+}
+
 // ── Pi Tool Name Mapping ─────────────────────────────────
 // Pi uses lowercase; shared extractors expect PascalCase (Claude Code convention).
 const PI_TOOL_MAP: Record<string, string> = {
@@ -652,24 +676,72 @@ export default function piExtension(pi: any): void {
 
       // Pi-1: Lightweight routing anchor — 7KB routing block is too heavy
       // for Pi's context budget. Tool descriptions from pi.registerTool()
-      // already tell the model what each tool does, so we omit the anchor
-      // string entirely. The pi host already exposes the full tool inventory
-      // and the model's own tool-selection logic is authoritative — an extra
-      // "Hierarchy: ctx_* > ctx_*" line only confuses the model about what
-      // tools it actually has.
+      // already tell the model what each tool does. This anchor gives the
+      // deliberate choice (which tool for which scenario) without the full
+      // block/redirect/memory/tool-selection hierarchy.
       //
-      // Pi-3 + Pi-4: Auto-injection of session memory (decisions, skills,
-      // intent) is also skipped. The author's own issue #856 already flagged
-      // that re-injecting `role` events on every turn can produce do-nothing
-      // loops; the same class of failure applies to pinned decisions/skills.
-      // Session events are still captured to the context-mode DB and remain
-      // queryable on demand via ctx_search(source: "session-events").
+      // Opt out with CONTEXT_MODE_PI_ANCHOR=0.
+      if (!isOptOut("CONTEXT_MODE_PI_ANCHOR")) {
+        parts.push(
+          "context-mode active. Hierarchy: ctx_batch_execute > ctx_execute > ctx_execute_file > ctx_search. " +
+          "Read/edit files → ctx_execute_file. Multi-command research → ctx_batch_execute. " +
+          "Web pages → ctx_fetch_and_index then ctx_search. Index docs → ctx_index. " +
+          "Stats → ctx_stats. Doctor → ctx_doctor. Upgrade → ctx_upgrade. Purge → ctx_purge."
+        );
+      }
+
+      // Pi-3 + Pi-4: Always build active_memory (not just post-compact),
+      // capped at 500 tokens via buildAutoInjection. Falls back to inline
+      // budget loop if the helper is unavailable.
       //
-      // -- fork: ttxs69/context-mode, 2026-06-28: hierarchy anchor and
-      //    auto-injected <active_memory> / <session_state source="compaction">
-      //    block removed for pi (system prompt stays clean; tool inventory
-      //    comes from pi.registerTool() only).
+      // Issue #856 — do NOT re-inject `role` as a standing behavioral_directive
+      // on every turn. A casual past phrase that classified as a role would
+      // otherwise be pinned and replayed each turn ("since you said 'that's
+      // fine for now', I'll leave it"), producing a do-nothing loop. Defense in
+      // depth: even if a stale `role` event exists (from an older build, or a
+      // genuine persona the user has since moved past), it must not become an
+      // inescapable per-turn standing order. Role events stay in the DB and
+      // remain queryable via ctx_search(source: "session-events"); intent,
+      // skills, decisions, and the resume snapshot are unaffected.
       //
+      // Opt out entirely with CONTEXT_MODE_PI_AUTO_INJECT=0. When opted out,
+      // session events are still captured to the context-mode DB and remain
+      // queryable on demand via ctx_search(source: "session-events") — they
+      // just aren't auto-pinned to the system prompt on every turn.
+      if (!isOptOut("CONTEXT_MODE_PI_AUTO_INJECT")) {
+        const activeEvents = db
+          .getEvents(_sessionId, {
+            minPriority: 3,
+            limit: 50,
+          })
+          .filter((e: any) => String(e.category ?? "") !== "role");
+        if (activeEvents.length > 0) {
+          const buildAuto = await getAutoInjection(pluginRoot);
+          let memoryContext = "";
+          if (buildAuto) {
+            memoryContext = buildAuto(
+              activeEvents.map((e: any) => ({
+                category: String(e.category ?? ""),
+                data: String(e.data ?? ""),
+              })),
+            );
+          }
+          // Fallback (or if helper produced empty output): inline 500-token cap.
+          if (!memoryContext) {
+            const memoryLines: string[] = ["<active_memory>"];
+            let budget = 2000; // ~500 tokens at 4 chars/token
+            for (const ev of activeEvents) {
+              const line = `  <event type="${ev.type}" category="${ev.category}">${ev.data}</event>`;
+              if (line.length > budget) break;
+              memoryLines.push(line);
+              budget -= line.length;
+            }
+            memoryLines.push("</active_memory>");
+            if (memoryLines.length > 2) memoryContext = memoryLines.join("\n");
+          }
+          if (memoryContext) parts.push(memoryContext);
+        }
+      }
 
       // Resume snapshot (only when present and unconsumed).
       const resume = db.getResume(_sessionId);
